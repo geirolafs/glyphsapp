@@ -1,17 +1,17 @@
 #MenuTitle: Interpolation Preview
 # -*- coding: utf-8 -*-
-__doc__ = """Preview interpolation along the font's axes with one slider per axis. Type text to preview a string, or leave the field empty to follow the selected glyphs. Kerning is not applied."""
+__doc__ = """Preview interpolation along the font's axes with one slider per axis. Type text to preview a string, or leave the field empty to follow the selected glyphs. Shows interpolated kerning, at a fixed size or fitted to the window."""
 
 import sys
 import traceback
 import objc
-from vanilla import FloatingWindow, Slider, TextBox, Group, EditText, PopUpButton
+from vanilla import FloatingWindow, Slider, TextBox, Group, EditText, PopUpButton, CheckBox
 from AppKit import (
 	NSView, NSColor, NSBezierPath, NSAffineTransform, NSMakeRect, NSMakePoint,
 	NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
 	NSAttributedString, NSViewWidthSizable, NSViewHeightSizable,
 )
-from GlyphsApp import Glyphs, GSInstance, UPDATEINTERFACE
+from GlyphsApp import Glyphs, GSInstance, UPDATEINTERFACE, LTR
 
 
 BAR_COLORS = [
@@ -21,7 +21,9 @@ BAR_COLORS = [
 	NSColor.colorWithCalibratedRed_green_blue_alpha_(0.75, 0.25, 0.55, 1),  # purple
 	NSColor.colorWithCalibratedRed_green_blue_alpha_(0.85, 0.20, 0.20, 1),  # red
 ]
-MAX_GLYPHS = 40
+MAX_GLYPHS = 300
+# Pixels per em. None fits the text to the window.
+SIZES = [None, 12, 16, 24, 36, 48, 72, 96, 144, 200]
 PAD = 20
 AXIS_ROW_H = 50
 BAR_ROW_H = 22
@@ -55,6 +57,32 @@ def drawText(text, x, y, size=12, color=None):
 	NSAttributedString.alloc().initWithString_attributes_(text, attrs).drawAtPoint_(NSMakePoint(x, y))
 
 
+def kerningBetween(left, right):
+	k = left.nextKerningForLayer_direction_(right, LTR)
+	# Glyphs returns a huge placeholder when a pair has no kerning at all
+	return k if k is not None and abs(k) < 1e6 else 0
+
+
+def wrapLines(glyphs, advances, maxWidth):
+	"""Split glyph indices into lines, breaking after spaces."""
+	lines, line, lineW, word, wordW = [], [], 0, [], 0
+	for i, g in enumerate(glyphs):
+		word.append(i)
+		wordW += advances[i]
+		isSpace = g.unicode == "0020"
+		if isSpace or i == len(glyphs) - 1:
+			visibleW = wordW - (advances[i] if isSpace else 0)
+			if line and lineW + visibleW > maxWidth:
+				lines.append(line)
+				line, lineW = [], 0
+			line += word
+			lineW += wordW
+			word, wordW = [], 0
+	if line:
+		lines.append(line)
+	return lines
+
+
 class InterpolationPreview:
 	def __init__(self):
 		self.closed = False
@@ -84,7 +112,7 @@ class InterpolationPreview:
 		nAxes, nMasters = len(self.axes), len(self.masters)
 		bottomH = 10 + 30 + nAxes * AXIS_ROW_H + nMasters * BAR_ROW_H + 8
 		W, H = 560, 380 + bottomH
-		self.w = FloatingWindow((W, H), "Interpolation – %s" % font.familyName, minSize=(380, 200 + bottomH))
+		self.w = FloatingWindow((W, H), "Interpolation – %s" % font.familyName, minSize=(480, 200 + bottomH))
 
 		self.w.text = EditText(
 			(10, 10, -10, 22), "",
@@ -119,6 +147,12 @@ class InterpolationPreview:
 			["Jump to instance…"] + [inst.name for inst in self.namedInstances],
 			sizeStyle="small", callback=self._instanceCB,
 		)
+		self.w.sizePopup = PopUpButton(
+			(245, y, 100, 22),
+			["Size: Fit" if v is None else "Size: %d px" % v for v in SIZES],
+			sizeStyle="small", callback=self._changedCB,
+		)
+		self.w.kerning = CheckBox((360, y, 100, 22), "Kerning", value=True, sizeStyle="small", callback=self._changedCB)
 		y += 30
 
 		# Per-master bars show each master's share of the current mix
@@ -224,36 +258,54 @@ class InterpolationPreview:
 				color=NSColor.systemRedColor())
 			return
 
-		# Scale from fixed metrics and the widest master widths, so the
-		# preview keeps its scale while the slider moves.
 		desc = min(m.descender for m in self.masters)
 		asc = max(max(m.ascender, m.capHeight) for m in self.masters)
-		maxW = sum(max(g.layers[m.id].width for m in self.masters) for g in glyphs)
-		s = min((W - 2 * PAD) / max(maxW, 1), (H - 2 * PAD) / (asc - desc))
-		x0 = (W - maxW * s) / 2
-		baseY = (H - (asc - desc) * s) / 2 - desc * s
-
-		guide = NSColor.tertiaryLabelColor()
-		guide.set()
-		NSBezierPath.fillRect_(NSMakeRect(PAD / 2, baseY, W - PAD, 1))
-
 		proxy = self.instance.interpolatedFontProxy
-		x = x0
-		NSColor.textColor().set()
-		for g in glyphs:
-			layer = proxy.glyphs[g.name].layers[0]
-			path = layer.completeBezierPath
-			if path:
-				xf = NSAffineTransform.transform()
-				xf.translateXBy_yBy_(x, baseY)
-				xf.scaleBy_(s)
-				xf.transformBezierPath_(path).fill()
-			x += layer.width * s
+		layers = [proxy.glyphs[g.name].layers[0] for g in glyphs]
+		kern = self.w.kerning.get()
+		advances = [
+			layer.width + (kerningBetween(layer, layers[i + 1]) if kern and i + 1 < len(layers) else 0)
+			for i, layer in enumerate(layers)
+		]
+		guide = NSColor.tertiaryLabelColor()
+		size = SIZES[self.w.sizePopup.get()]
 
-		# Advance width markers at the start and end of the run
-		guide.set()
-		for gx in (x0, x):
-			NSBezierPath.fillRect_(NSMakeRect(gx, baseY + desc * s, 1, (asc - desc) * s))
+		if size is None:
+			# Scale from fixed metrics and the widest master widths, so the
+			# preview keeps its scale while the slider moves.
+			maxW = sum(max(g.layers[m.id].width for m in self.masters) for g in glyphs)
+			s = min((W - 2 * PAD) / max(maxW, 1), (H - 2 * PAD) / (asc - desc))
+			x0 = (W - maxW * s) / 2
+			baseY = (H - (asc - desc) * s) / 2 - desc * s
+			lines = [list(range(len(layers)))]
+		else:
+			s = size / float(self.font.upm)
+			x0 = PAD
+			baseY = H - PAD - asc * s
+			lines = wrapLines(glyphs, advances, (W - 2 * PAD) / s)
+		lineH = (asc - desc) * s * 1.2
+
+		for line in lines:
+			if baseY + desc * s < 0:
+				break
+			guide.set()
+			NSBezierPath.fillRect_(NSMakeRect(PAD / 2, baseY, W - PAD, 1))
+			x = x0
+			NSColor.textColor().set()
+			for i in line:
+				path = layers[i].completeBezierPath
+				if path:
+					xf = NSAffineTransform.transform()
+					xf.translateXBy_yBy_(x, baseY)
+					xf.scaleBy_(s)
+					xf.transformBezierPath_(path).fill()
+				x += advances[i] * s
+			if size is None:
+				# Advance width markers at the start and end of the run
+				guide.set()
+				for gx in (x0, x):
+					NSBezierPath.fillRect_(NSMakeRect(gx, baseY + desc * s, 1, (asc - desc) * s))
+			baseY -= lineH
 
 	def _drawTicks(self, view, axisIndex):
 		lo, hi = self.ranges[axisIndex]
