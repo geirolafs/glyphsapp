@@ -1,16 +1,17 @@
 #MenuTitle: Interpolation Preview
 # -*- coding: utf-8 -*-
-__doc__ = """Preview glyph interpolation between masters with a slider."""
+__doc__ = """Preview interpolation along the font's axes with one slider per axis. Type text to preview a string, or leave the field empty to follow the selected glyphs. Kerning is not applied."""
 
+import sys
 import traceback
-from vanilla import FloatingWindow, Slider, TextBox, Group
+import objc
+from vanilla import FloatingWindow, Slider, TextBox, Group, EditText, PopUpButton
 from AppKit import (
-	NSImage, NSImageView, NSColor, NSAffineTransform,
-	NSMakeRect, NSRectFill, NSImageScaleProportionallyDown,
-	NSView, NSBezierPath,
+	NSView, NSColor, NSBezierPath, NSAffineTransform, NSMakeRect, NSMakePoint,
+	NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+	NSAttributedString, NSViewWidthSizable, NSViewHeightSizable,
 )
-from objc import super as objc_super
-from GlyphsApp import Glyphs, GSInstance
+from GlyphsApp import Glyphs, GSInstance, UPDATEINTERFACE
 
 
 BAR_COLORS = [
@@ -20,187 +21,272 @@ BAR_COLORS = [
 	NSColor.colorWithCalibratedRed_green_blue_alpha_(0.75, 0.25, 0.55, 1),  # purple
 	NSColor.colorWithCalibratedRed_green_blue_alpha_(0.85, 0.20, 0.20, 1),  # red
 ]
+MAX_GLYPHS = 40
+PAD = 20
+AXIS_ROW_H = 50
+BAR_ROW_H = 22
 
 
-class BarView(NSView):
-	"""Horizontal fill bar: colored portion (0–1) on gray background."""
+# The ObjC class outlives the script run, so it only forwards drawing to a
+# Python callback. Drawing code can then change without restarting Glyphs.
+try:
+	IPCallbackView = objc.lookUpClass("IPCallbackView")
+except objc.nosuchclass_error:
+	class IPCallbackView(NSView):
+		def drawRect_(self, rect):
+			callback = getattr(self, "drawCallback", None)
+			if callback:
+				callback(self)
 
-	def initWithFrame_(self, frame):
-		self = objc_super(BarView, self).initWithFrame_(frame)
-		if self is None:
-			return None
-		self._proportion = 0.0
-		self._color = BAR_COLORS[0]
-		return self
 
-	def setColor_(self, color):
-		self._color = color
-		self.setNeedsDisplay_(True)
+def addCallbackView(group, callback):
+	view = IPCallbackView.alloc().initWithFrame_(group.getNSView().bounds())
+	view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+	view.drawCallback = callback
+	group.getNSView().addSubview_(view)
+	return view
 
-	def setProportion_(self, p):
-		self._proportion = max(0.0, min(1.0, p))
-		self.setNeedsDisplay_(True)
 
-	def drawRect_(self, rect):
-		b = self.bounds()
-		NSColor.colorWithCalibratedWhite_alpha_(0.85, 1).set()
-		NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(b, 3, 3).fill()
-		if self._proportion > 0:
-			filled = NSMakeRect(b.origin.x, b.origin.y, b.size.width * self._proportion, b.size.height)
-			self._color.set()
-			NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(filled, 3, 3).fill()
+def drawText(text, x, y, size=12, color=None):
+	attrs = {
+		NSFontAttributeName: NSFont.systemFontOfSize_(size),
+		NSForegroundColorAttributeName: color or NSColor.secondaryLabelColor(),
+	}
+	NSAttributedString.alloc().initWithString_attributes_(text, attrs).drawAtPoint_(NSMakePoint(x, y))
 
 
 class InterpolationPreview:
 	def __init__(self):
+		self.closed = False
 		font = Glyphs.font
 		if not font:
 			self._bail("No font open")
 			return
-		if not font.selectedLayers:
-			self._bail("No glyph selected")
-			return
-
-		self.font = font
-		self.glyph = font.selectedLayers[0].parent
-		self.masters = list(font.masters)
-
-		if len(self.masters) < 2:
+		if len(font.masters) < 2:
 			self._bail("Need at least 2 masters")
 			return
 
-		nMasters = len(self.masters)
-		barAreaH = nMasters * 22 + 8
-		W, H = 500, 440 + barAreaH
-		self.imgW = W - 20
-		self.imgH = H - 80 - barAreaH
+		self.font = font
+		self.masters = list(font.masters)
+		self.axes = list(font.axes)
+		self.ranges = [
+			(min(m.axes[i] for m in self.masters), max(m.axes[i] for m in self.masters))
+			for i in range(len(self.axes))
+		]
+		self.namedInstances = [i for i in font.instances if getattr(i, "type", 0) == 0]
 
-		self.w = FloatingWindow((W, H), u"Interpolation \u2013 %s" % self.glyph.name)
+		# One detached instance for the whole session. Setting .font without
+		# adding it to font.instances leaves the document unchanged.
+		self.instance = GSInstance()
+		self.instance.font = font
+		self.instance.axes = list(self.masters[0].axes)
 
-		# Use a Group + raw NSImageView (more reliable than vanilla ImageView)
-		self.w.previewGroup = Group((10, 10, -10, -60 - barAreaH))
-		self.nsImageView = NSImageView.alloc().initWithFrame_(
-			NSMakeRect(0, 0, self.imgW, self.imgH)
+		nAxes, nMasters = len(self.axes), len(self.masters)
+		bottomH = 10 + 30 + nAxes * AXIS_ROW_H + nMasters * BAR_ROW_H + 8
+		W, H = 560, 380 + bottomH
+		self.w = FloatingWindow((W, H), "Interpolation – %s" % font.familyName, minSize=(380, 200 + bottomH))
+
+		self.w.text = EditText(
+			(10, 10, -10, 22), "",
+			placeholder="Type text or /glyphname, or leave empty to follow the selection",
+			callback=self._changedCB,
 		)
-		self.nsImageView.setImageScaling_(NSImageScaleProportionallyDown)
-		self.w.previewGroup.getNSView().addSubview_(self.nsImageView)
+		self.w.previewGroup = Group((10, 42, -10, -bottomH))
+		self.preview = addCallbackView(self.w.previewGroup, self._drawPreview)
 
-		sliderBottom = 50 + barAreaH
-		self.w.slider = Slider(
-			(15, -sliderBottom, -10, 23),
-			minValue=0, maxValue=1, value=0,
-			continuous=True, callback=self._sliderCB,
+		# Axis sliders, each with a value label and instance tick marks
+		self.sliders, self.axisLabels, self.tickViews = [], [], []
+		y = -bottomH + 8
+		for i, axis in enumerate(self.axes):
+			lo, hi = self.ranges[i]
+			label = TextBox((15, y, -10, 17), "", sizeStyle="small")
+			slider = Slider(
+				(15, y + 16, -10, 23),
+				minValue=lo, maxValue=hi, value=self.instance.axes[i],
+				continuous=True, callback=self._changedCB,
+			)
+			ticks = Group((15, y + 38, -10, 6))
+			setattr(self.w, "axisLabel%d" % i, label)
+			setattr(self.w, "axisSlider%d" % i, slider)
+			setattr(self.w, "axisTicks%d" % i, ticks)
+			self.axisLabels.append(label)
+			self.sliders.append(slider)
+			self.tickViews.append(addCallbackView(ticks, lambda v, i=i: self._drawTicks(v, i)))
+			y += AXIS_ROW_H
+
+		self.w.instancePopup = PopUpButton(
+			(15, y, 220, 22),
+			["Jump to instance…"] + [inst.name for inst in self.namedInstances],
+			sizeStyle="small", callback=self._instanceCB,
 		)
+		y += 30
 
-		# Per-master bar rows
-		self.bars = []
-		self.barLabels = []
-		barY = H - 10 - barAreaH + 4
-		nameW = 120
-		pctW = 45
-		barX = nameW + 15
-		barW = W - barX - pctW - 20
+		# Per-master bars show each master's share of the current mix
+		self.bars, self.barLabels, self.shares = [], [], [0.0] * nMasters
+		nameW, pctW = 120, 45
 		for i, m in enumerate(self.masters):
-			y = barY + i * 22
-			color = BAR_COLORS[i % len(BAR_COLORS)]
-			attrName = "masterName%d" % i
-			setattr(self.w, attrName, TextBox((15, y, nameW, 18), m.name, sizeStyle="small"))
-			barView = BarView.alloc().initWithFrame_(NSMakeRect(0, 0, barW, 14))
-			barView.setColor_(color)
-			attrBar = "barGroup%d" % i
-			setattr(self.w, attrBar, Group((barX, y + 1, barW, 14)))
-			getattr(self.w, attrBar).getNSView().addSubview_(barView)
-			self.bars.append(barView)
-			attrPct = "pctLabel%d" % i
-			setattr(self.w, attrPct, TextBox((barX + barW + 5, y, pctW, 18), "0%", alignment="right", sizeStyle="small"))
-			self.barLabels.append(getattr(self.w, attrPct))
+			setattr(self.w, "masterName%d" % i, TextBox((15, y, nameW, 18), m.name, sizeStyle="small"))
+			barGroup = Group((nameW + 15, y + 1, -(pctW + 20), 14))
+			setattr(self.w, "barGroup%d" % i, barGroup)
+			self.bars.append(addCallbackView(barGroup, lambda v, i=i: self._drawBar(v, i)))
+			pct = TextBox((-(pctW + 15), y, pctW, 18), "0%", alignment="right", sizeStyle="small")
+			setattr(self.w, "pctLabel%d" % i, pct)
+			self.barLabels.append(pct)
+			y += BAR_ROW_H
 
-		self._updateBars(0)
-		self._render(0)
+		self.w.bind("close", self._windowClosed)
+		Glyphs.addCallback(self._interfaceUpdated, UPDATEINTERFACE)
+		self._update()
 		self.w.open()
 
 	def _bail(self, msg):
+		self.closed = True
 		Glyphs.showMacroWindow()
 		print("Interpolation Preview:", msg)
 
-	def _sliderCB(self, sender):
-		v = sender.get()
-		self._updateBars(v)
-		self._render(v)
+	def _windowClosed(self, sender):
+		self.closed = True
+		Glyphs.removeCallback(self._interfaceUpdated, UPDATEINTERFACE)
 
-	def _updateBars(self, t):
-		n = len(self.masters)
-		for i in range(n):
-			if i == 0:
-				p = 1.0 - t
-			elif i == n - 1:
-				p = t
+	# Callbacks
+
+	def _changedCB(self, sender):
+		self._update()
+
+	def _interfaceUpdated(self, info):
+		# Fires on selection changes and outline edits
+		self.preview.setNeedsDisplay_(True)
+
+	def _instanceCB(self, sender):
+		index = sender.get()
+		if index > 0:
+			values = self.namedInstances[index - 1].axes
+			for slider, value in zip(self.sliders, values):
+				slider.set(value)
+			sender.set(0)
+			self._update()
+
+	def _update(self):
+		self.instance.axes = [s.get() for s in self.sliders]
+		for i, axis in enumerate(self.axes):
+			self.axisLabels[i].set("%s  %g" % (axis.name, round(self.sliders[i].get(), 1)))
+		mix = dict(self.instance.instanceInterpolations)
+		self.shares = [max(0.0, min(1.0, mix.get(m.id, 0.0))) for m in self.masters]
+		for i, share in enumerate(self.shares):
+			self.barLabels[i].set("%d%%" % round(share * 100))
+			self.bars[i].setNeedsDisplay_(True)
+		self.preview.setNeedsDisplay_(True)
+
+	# Glyph lookup
+
+	def _sourceGlyphs(self):
+		"""Glyphs to preview, from the text field or else the current selection."""
+		text = self.w.text.get()
+		if not text:
+			return [l.parent for l in (self.font.selectedLayers or [])][:MAX_GLYPHS]
+		glyphs, i = [], 0
+		while i < len(text) and len(glyphs) < MAX_GLYPHS:
+			if text[i] == "/":
+				j = i + 1
+				while j < len(text) and text[j] not in " /":
+					j += 1
+				glyph = self.font.glyphs[text[i + 1:j]]
+				i = j + 1 if j < len(text) and text[j] == " " else j
 			else:
-				p = 0.0
-			self.bars[i].setProportion_(p)
-			self.barLabels[i].set("%d%%" % round(p * 100))
+				glyph = self.font.glyphForCharacter_(ord(text[i]))
+				i += 1
+			if glyph:
+				glyphs.append(glyph)
+		return glyphs
 
-	def _render(self, t):
+	# Drawing
+
+	def _drawPreview(self, view):
 		try:
-			m0, m1 = self.masters[0], self.masters[-1]
-
-			# Create a temporary instance and add to font so interpolatedFont works
-			instance = GSInstance()
-			instance.manualInterpolation = True
-			instance.instanceInterpolations = {m0.id: 1.0 - t, m1.id: t}
-			self.font.instances.append(instance)
-			try:
-				interpFont = instance.interpolatedFont
-			finally:
-				self.font.instances.remove(instance)
-
-			if not interpFont:
-				return
-
-			g = interpFont.glyphs[self.glyph.name]
-			if not g:
-				return
-
-			layer = g.layers[0]
-			bp = layer.completeBezierPath or layer.bezierPath
-			if not bp:
-				return
-
-			# Render to NSImage (Cocoa coords = Y-up, same as font)
-			img = NSImage.alloc().initWithSize_((self.imgW, self.imgH))
-			img.lockFocus()
-
-			NSColor.whiteColor().set()
-			NSRectFill(NSMakeRect(0, 0, self.imgW, self.imgH))
-
-			b = bp.bounds()
-			if b.size.width > 0 and b.size.height > 0:
-				pad = 20
-				s = min(
-					(self.imgW - pad * 2) / b.size.width,
-					(self.imgH - pad * 2) / b.size.height,
-				)
-				ox = (self.imgW - b.size.width * s) / 2
-				oy = (self.imgH - b.size.height * s) / 2
-
-				xf = NSAffineTransform.transform()
-				xf.translateXBy_yBy_(ox, oy)
-				xf.scaleBy_(s)
-				xf.translateXBy_yBy_(-b.origin.x, -b.origin.y)
-
-				NSColor.blackColor().set()
-				xf.transformBezierPath_(bp).fill()
-
-			img.unlockFocus()
-			self.nsImageView.setImage_(img)
-
-		except:
+			self._drawPreviewUnsafe(view)
+		except Exception:
 			Glyphs.showMacroWindow()
 			traceback.print_exc()
 
+	def _drawPreviewUnsafe(self, view):
+		b = view.bounds()
+		W, H = b.size.width, b.size.height
+		NSColor.textBackgroundColor().set()
+		NSBezierPath.fillRect_(b)
+
+		glyphs = self._sourceGlyphs()
+		if not glyphs:
+			drawText("Select a glyph or type text.", PAD, H / 2)
+			return
+		incompatible = [g.name for g in glyphs if not g.mastersCompatible]
+		if incompatible:
+			drawText("Masters are not compatible: %s" % ", ".join(sorted(set(incompatible))), PAD, H / 2,
+				color=NSColor.systemRedColor())
+			return
+
+		# Scale from fixed metrics and the widest master widths, so the
+		# preview keeps its scale while the slider moves.
+		desc = min(m.descender for m in self.masters)
+		asc = max(max(m.ascender, m.capHeight) for m in self.masters)
+		maxW = sum(max(g.layers[m.id].width for m in self.masters) for g in glyphs)
+		s = min((W - 2 * PAD) / max(maxW, 1), (H - 2 * PAD) / (asc - desc))
+		x0 = (W - maxW * s) / 2
+		baseY = (H - (asc - desc) * s) / 2 - desc * s
+
+		guide = NSColor.tertiaryLabelColor()
+		guide.set()
+		NSBezierPath.fillRect_(NSMakeRect(PAD / 2, baseY, W - PAD, 1))
+
+		proxy = self.instance.interpolatedFontProxy
+		x = x0
+		NSColor.textColor().set()
+		for g in glyphs:
+			layer = proxy.glyphs[g.name].layers[0]
+			path = layer.completeBezierPath
+			if path:
+				xf = NSAffineTransform.transform()
+				xf.translateXBy_yBy_(x, baseY)
+				xf.scaleBy_(s)
+				xf.transformBezierPath_(path).fill()
+			x += layer.width * s
+
+		# Advance width markers at the start and end of the run
+		guide.set()
+		for gx in (x0, x):
+			NSBezierPath.fillRect_(NSMakeRect(gx, baseY + desc * s, 1, (asc - desc) * s))
+
+	def _drawTicks(self, view, axisIndex):
+		lo, hi = self.ranges[axisIndex]
+		if hi <= lo:
+			return
+		b = view.bounds()
+		# Match the slider's knob travel, which stops half a knob from each end
+		try:
+			inset = self.sliders[axisIndex].getNSSlider().cell().knobThickness() / 2
+		except AttributeError:
+			inset = 10
+		NSColor.secondaryLabelColor().set()
+		for inst in self.namedInstances:
+			v = inst.axes[axisIndex]
+			x = inset + (v - lo) / (hi - lo) * (b.size.width - 2 * inset)
+			NSBezierPath.fillRect_(NSMakeRect(round(x), 0, 1, b.size.height))
+
+	def _drawBar(self, view, i):
+		b = view.bounds()
+		NSColor.quaternaryLabelColor().set()
+		NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(b, 3, 3).fill()
+		if self.shares[i] > 0:
+			filled = NSMakeRect(b.origin.x, b.origin.y, b.size.width * self.shares[i], b.size.height)
+			BAR_COLORS[i % len(BAR_COLORS)].set()
+			NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(filled, 3, 3).fill()
+
+
+previous = getattr(sys, "_ip_instance", None)
+if previous is not None and getattr(previous, "w", None) and previous.w.getNSWindow() is not None:
+	previous.w.close()
 
 try:
-	InterpolationPreview()
-except:
+	sys._ip_instance = InterpolationPreview()
+except Exception:
 	Glyphs.showMacroWindow()
 	traceback.print_exc()
