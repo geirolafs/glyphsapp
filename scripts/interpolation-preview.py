@@ -63,6 +63,26 @@ def kerningBetween(left, right):
 	return k if k is not None and abs(k) < 1e6 else 0
 
 
+def runExtents(glyphs, masters, kern):
+	"""Union of the outline bounds of a glyph run over all masters, with kerning."""
+	left = bottom = right = top = 0
+	for m in masters:
+		layers = [g.layers[m.id] for g in glyphs]
+		x = 0
+		for i, layer in enumerate(layers):
+			b = layer.bounds
+			if b.size.width > 0:
+				left = min(left, x + b.origin.x)
+				right = max(right, x + b.origin.x + b.size.width)
+				bottom = min(bottom, b.origin.y)
+				top = max(top, b.origin.y + b.size.height)
+			x += layer.width
+			if kern and i + 1 < len(layers):
+				x += kerningBetween(layer, layers[i + 1])
+			right = max(right, x)
+	return left, bottom, right, top
+
+
 def wrapLines(glyphs, advances, maxWidth):
 	"""Split glyph indices into lines, breaking after spaces."""
 	lines, line, lineW, word, wordW = [], [], 0, [], 0
@@ -271,12 +291,13 @@ class InterpolationPreview:
 		size = SIZES[self.w.sizePopup.get()]
 
 		if size is None:
-			# Scale from fixed metrics and the widest master widths, so the
-			# preview keeps its scale while the slider moves.
-			maxW = sum(max(g.layers[m.id].width for m in self.masters) for g in glyphs)
-			s = min((W - 2 * PAD) / max(maxW, 1), (H - 2 * PAD) / (asc - desc))
-			x0 = (W - maxW * s) / 2
-			baseY = (H - (asc - desc) * s) / 2 - desc * s
+			# Scale from the outline bounds of all masters, so the preview keeps
+			# its scale while the slider moves and nothing is clipped.
+			left, bottom, right, top = runExtents(glyphs, self.masters, kern)
+			bottom, top = min(bottom, desc), max(top, asc)
+			s = min((W - 2 * PAD) / max(right - left, 1), (H - 2 * PAD) / (top - bottom))
+			x0 = (W - (right - left) * s) / 2 - left * s
+			baseY = (H - (top - bottom) * s) / 2 - bottom * s
 			lines = [list(range(len(layers)))]
 		else:
 			s = size / float(self.font.upm)
